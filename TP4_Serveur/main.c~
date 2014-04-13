@@ -1,0 +1,238 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <errno.h>
+#include <string.h>
+#include <pthread.h>
+
+#include "serveur.h"
+#include "client.h"
+
+static client_t client_thread = { .mutex_sock = PTHREAD_MUTEX_INITIALIZER,};
+
+static void init(void)
+{
+#ifdef WIN32
+   WSADATA wsa;
+   int err = WSAStartup(MAKEWORD(2, 2), &wsa);
+   if(err < 0)
+   {
+      puts("WSAStartup failed !");
+      exit(EXIT_FAILURE);
+   }
+#endif
+}
+
+static void end(void)
+{
+#ifdef WIN32
+   WSACleanup();
+#endif
+}
+
+void *connection_handler(void *);
+
+static void app(void)
+{
+    int socket_desc , client_sock , c , *new_sock;
+    struct sockaddr_in server , client;
+     
+    /* Création de socket */
+    socket_desc = socket(AF_INET , SOCK_STREAM , 0);
+    if (socket_desc == -1)
+    {
+        printf("Could not create socket");
+    }
+    puts("Socket created");
+     
+    /* Préparation de la structure sockaddr_in */
+    server.sin_family = AF_INET;
+    server.sin_addr.s_addr = INADDR_ANY;
+    server.sin_port = htons( PORT );
+     
+    /* Bind */
+    if( bind(socket_desc,(struct sockaddr *)&server , sizeof(server)) < 0)
+    {
+        //print the error message
+        perror("Bind failed. Error");
+        return 1;
+    }
+    puts("Bind done");
+     
+    /* Listen */
+    listen(socket_desc , MAX_CLIENTS); // MAX_CLIENTS défini dans serveur.h
+     
+    /* On accepte et on attend pour une connexion */
+    puts("Waiting for incoming connections...");
+    c = sizeof(struct sockaddr_in);
+    
+    while( (client_sock = accept(socket_desc, (struct sockaddr *)&client, (socklen_t*)&c)) )
+    {
+        puts("Connection accepted");
+        
+        
+        new_sock = malloc(1);
+        *new_sock = client_sock;
+        
+        /* Création d'un nouveau thread */
+        if( pthread_create( &client_thread.sock_thread, NULL ,  connection_handler , (void*) new_sock) < 0)
+        {
+            perror("could not create thread");
+            return 1;
+        }
+        
+        puts("Handler assigned");
+        
+    }
+     
+    if (client_sock < 0)
+    {
+        perror("accept failed");
+        return 1;
+    }
+   
+   
+   //end_connection(sock);
+}
+
+
+int main(int argc, char **argv)
+{
+   init();
+
+   app();
+
+   end();
+
+   return EXIT_SUCCESS;
+}
+
+
+/*
+ * Lancement du programme pour chaque client
+ * */
+void *connection_handler(void *socket_desc)
+{
+    /* Récupération de la socket de description */
+    int sock = *(int*)socket_desc;
+    int read_size;
+    char *message , client_message[BUF_SIZE], nom[BUF_SIZE], prenom[BUF_SIZE], query[BUF_SIZE];
+    
+    MYSQL mysql;
+    mysql_init(&mysql);
+    mysql_options(&mysql,MYSQL_READ_DEFAULT_GROUP,"option");
+    
+    /* Connexion à la base de données */
+    
+    /* VALEUR A MODIFIER DANS LE PROGRAMME */
+    if(mysql_real_connect(&mysql,"localhost","root","root","TP4",0,NULL,0))
+    {
+        puts("Connected to MySql server !");
+    }
+    else
+    {
+        puts("Une erreur s'est produite lors de la connexion à la BDD!");
+    }
+    
+    int breakpoint = 0;
+    //Receive a message from client
+    while( (read_size = recv(sock , client_message , 2000 , 0)) > 0 )
+    {
+        MYSQL_RES * result = NULL;
+        MYSQL_ROW row;
+        unsigned int i = 0;
+        unsigned int num_champs = 0;
+        /* Test de la valeur reçue */
+        if (strcmp(client_message,"1") == 0){
+          mysql_query(&mysql, "SELECT * FROM TP4");
+          result = mysql_use_result(&mysql);
+          
+          num_champs = mysql_num_fields(result);
+          
+          while ((row = mysql_fetch_row(result))){
+           for (i=0; i < num_champs; i+=2){
+            strcpy(client_message, row[i]);
+            strcat(client_message, " ");
+            strcat(client_message, row[i+1]);
+            strcat(client_message, "\n");
+           }
+           write(sock , client_message , strlen(client_message));
+          } //while()
+          
+          
+        }else if (strcmp(client_message,"2") == 0){
+          /* Début de la section critique */
+          pthread_mutex_lock (& client_thread.mutex_sock);
+          
+          /* On envoi au client qu'on passe dans le mode écriture */
+          strcpy(client_message, "Ecriture");
+          write(sock , client_message , strlen(client_message));
+          
+          /* Ecrase client_message et attends la valeur nom */
+          memset(&client_message[0],0, sizeof(client_message));
+          recv(sock , client_message , 2000 , 0);
+          strcpy(nom, client_message);
+          
+          /* Ecrase client_message et attends la valeur prenom */
+          memset(&client_message[0],0, sizeof(client_message));
+          recv(sock , client_message , 2000 , 0);
+          strcpy(prenom, client_message);
+          
+          /* Ecriture en base de données */
+          
+          strcpy(query, "INSERT INTO TP4 VALUE('");
+          strcat(query, nom);
+          strcat(query, "','");
+          strcat(query, prenom);
+          strcat(query, "')");
+          puts(query); // on affiche histoire de savoir ce qui est écrit
+          mysql_query(&mysql, query);
+          
+          memset(&client_message[0],0, sizeof(client_message));
+          memset(&nom[0],0, sizeof(nom));
+          memset(&prenom[0],0, sizeof(prenom));
+          memset(&query[0],0, sizeof(query));
+         	
+          /* Fin de la section critique */
+          pthread_mutex_unlock (& client_thread.mutex_sock);
+         
+          /* Envoi du message au client */
+          strcpy(client_message, "Ecriture done");
+		     	write(sock , client_message , strlen(client_message));
+		    }
+        else if (strcmp(client_message, "9") == 0){
+          strcpy(client_message, "Deconnexion");
+          breakpoint = 1;
+          /* Envoi du message au client */
+        	write(sock , client_message , strlen(client_message));
+        }
+        else {
+          strcpy(client_message, "Mauvais choix");
+          write(sock , client_message , strlen(client_message));
+        }
+        
+        
+        /* Effacement de la variable client_message */
+        memset(&client_message[0],0, sizeof(client_message));
+        
+        if (breakpoint == 1){
+          read_size = 0;
+          break;
+        } 
+    }
+     
+    if(read_size == 0)
+    {
+        puts("Client disconnected");
+        mysql_close(&mysql);
+        fflush(stdout);
+    }
+    else if(read_size == -1)
+    {
+        perror("recv failed");
+    }
+         
+    /* Libération de la socket */
+    free(socket_desc);
+     
+    return 0;
+}
